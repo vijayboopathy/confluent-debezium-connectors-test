@@ -99,9 +99,11 @@ services:
       timeout: 5s
       retries: 5
 
-  # Kafka Connect with Confluent PostgreSQL CDC Connector
+  # Kafka Connect with Debezium PostgreSQL CDC Connector
   kafka-connect:
-    image: confluentinc/cp-kafka-connect:7.5.0
+    build:
+      context: .
+      dockerfile: Dockerfile.connect
     container_name: kafka-connect
     hostname: kafka-connect
     depends_on:
@@ -131,24 +133,6 @@ services:
       CONNECT_LOG4J_LOGGERS: org.apache.zookeeper=ERROR,org.I0Itec.zkclient=ERROR,org.reflections=ERROR
     volumes:
       - ./connector-config.json:/connector-config.json
-    command:
-      - bash
-      - -c
-      - |
-        echo "Installing Confluent PostgreSQL CDC Source Connector v2..."
-        confluent-hub install --no-prompt confluentinc/kafka-connect-postgresql-cdc:2.8.0
-        echo "Starting Kafka Connect..."
-        /etc/confluent/docker/run &
-
-        # Wait for Kafka Connect to be ready
-        echo "Waiting for Kafka Connect to start..."
-        while [ $$(curl -s -o /dev/null -w %{http_code} http://localhost:8083/) -ne 200 ]; do
-          echo "Waiting for Kafka Connect to be ready..."
-          sleep 5
-        done
-
-        echo "Kafka Connect is ready!"
-        wait
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8083/"]
       interval: 10s

@@ -1,30 +1,42 @@
-# Confluent PostgreSQL CDC Connector Testing with Database Upgrade
+# Debezium PostgreSQL CDC Connector Testing with Database Upgrade
 
-This project tests the Confluent PostgreSQL CDC Source Connector v2 behavior during a PostgreSQL database upgrade, focusing on offset management and replication slot handling.
+This project tests the Debezium PostgreSQL CDC connector behavior during a PostgreSQL database upgrade, focusing on offset management and replication slot handling.
 
 ## Architecture
 
 ```
-Data Generator Service → PostgreSQL (with logical replication) → Replication Slot → Confluent CDC Connector → Kafka
+Data Generator Service → PostgreSQL (with logical replication) → Replication Slot → Debezium CDC Connector → Kafka
 ```
 
 ## Components
 
 - **PostgreSQL 16**: Configured with logical replication (`wal_level=logical`)
 - **Confluent Platform 7.5.0**: Kafka, Zookeeper, Schema Registry, Kafka Connect
-- **Confluent PostgreSQL CDC Source Connector v2 (2.8.0)**: CDC connector using PostgreSQL logical replication
+- **Debezium PostgreSQL CDC Connector 2.4.0**: Open-source CDC connector using pgoutput plugin
 - **Data Generator**: Python service that continuously writes to PostgreSQL
+
+## Important Note
+
+This project uses the **open-source Debezium PostgreSQL connector**, not the Confluent proprietary CDC connector. The Confluent PostgreSQL CDC Source Connector v2 is a commercial product that requires a Confluent Enterprise license and is not available for free download.
+
+Debezium is an excellent open-source alternative that provides:
+- Full CDC capabilities using PostgreSQL logical replication
+- Wide community adoption and support
+- Compatible with any Kafka distribution
+- Free to use in production
 
 ## Prerequisites
 
 - Docker and Docker Compose
 - At least 4GB of available RAM
 - Ports 5432, 9092, 8081, 8083 available
+- Internet connection (for initial build to download Debezium connector)
 
 ## Quick Start
 
-1. **Start the stack**:
+1. **Build and start the stack**:
    ```bash
+   docker-compose build
    docker-compose up -d
    ```
 
@@ -33,19 +45,29 @@ Data Generator Service → PostgreSQL (with logical replication) → Replication
    docker-compose ps
    ```
 
-3. **Deploy the CDC connector**:
+3. **Verify Debezium connector is available**:
+   ```bash
+   curl http://localhost:8083/connector-plugins | jq '.[] | select(.class | contains("Postgres"))'
+   ```
+
+4. **Deploy the CDC connector**:
    ```bash
    curl -X POST http://localhost:8083/connectors \
      -H "Content-Type: application/json" \
      -d @connector-config.json
    ```
 
-4. **Check connector status**:
+5. **Check connector status**:
    ```bash
-   curl http://localhost:8083/connectors/postgres-cdc-connector/status
+   curl http://localhost:8083/connectors/postgres-cdc-connector/status | jq '.'
    ```
 
-5. **Monitor CDC events**:
+6. **List CDC topics**:
+   ```bash
+   docker exec kafka kafka-topics --list --bootstrap-server localhost:9092 | grep cdc
+   ```
+
+7. **Monitor CDC events**:
    ```bash
    docker exec -it kafka kafka-console-consumer \
      --bootstrap-server localhost:9092 \
@@ -62,14 +84,14 @@ Before the upgrade, capture the current replication slot and offset information:
 ```bash
 # Check replication slot status
 docker exec -it postgres psql -U postgres -d testdb -c \
-  "SELECT * FROM pg_replication_slots WHERE slot_name = 'confluent_cdc_slot';"
+  "SELECT * FROM pg_replication_slots WHERE slot_name = 'debezium_slot';"
 
 # Check connector offset
 curl http://localhost:8083/connectors/postgres-cdc-connector/offsets
 
 # Note the LSN (Log Sequence Number)
 docker exec -it postgres psql -U postgres -d testdb -c \
-  "SELECT confirmed_flush_lsn FROM pg_replication_slots WHERE slot_name = 'confluent_cdc_slot';"
+  "SELECT confirmed_flush_lsn FROM pg_replication_slots WHERE slot_name = 'debezium_slot';"
 ```
 
 ### Step 2: Pause the Connector
@@ -131,10 +153,10 @@ docker exec postgres-new pg_restore -U postgres -d testdb /tmp/testdb_backup.dum
 docker exec -it postgres psql -U postgres -d testdb
 
 # Create the replication slot with the same name
-SELECT * FROM pg_create_logical_replication_slot('confluent_cdc_slot', 'pgoutput');
+SELECT * FROM pg_create_logical_replication_slot('debezium_slot', 'pgoutput');
 
 # Create publication
-CREATE PUBLICATION confluent_cdc_publication FOR TABLE public.orders, public.customers;
+CREATE PUBLICATION debezium_publication FOR TABLE public.orders, public.customers;
 
 # Set replica identity
 ALTER TABLE orders REPLICA IDENTITY FULL;
@@ -201,18 +223,18 @@ docker exec -it postgres psql -U postgres -d testdb -c \
 
 ## Offset Management Details
 
-The Confluent PostgreSQL CDC connector stores offsets in the Kafka topic `docker-connect-offsets`. Key information includes:
+The Debezium connector stores offsets in the Kafka topic `docker-connect-offsets`. Key information includes:
 
 - **LSN (Log Sequence Number)**: PostgreSQL's position in the WAL
 - **Transaction ID**: Last processed transaction
 - **Timestamp**: When the offset was recorded
 
 The connector configuration uses:
-- `slot.name`: `confluent_cdc_slot` - the replication slot name
-- `publication.name`: `confluent_cdc_publication` - the logical replication publication
+- `slot.name`: `debezium_slot` - the replication slot name
+- `publication.name`: `debezium_publication` - the logical replication publication
 - `snapshot.mode`: `initial` - takes initial snapshot, then streams changes
-- `output.data.format`: `AVRO` - outputs data in Avro format with Schema Registry integration
-- `after.state.only`: `true` - emits only the final state of the row (not before/after)
+- `plugin.name`: `pgoutput` - PostgreSQL's native logical replication output plugin
+- `transforms`: Uses `ExtractNewRecordState` to unwrap Debezium change events
 
 ## Automated Testing
 
@@ -235,6 +257,7 @@ This script will:
 ## Key Configuration Files
 
 - `docker-compose.yml`: Complete stack definition with PostgreSQL 16
+- `Dockerfile.connect`: Custom Kafka Connect image with Debezium pre-installed
 - `connector-config.json`: Debezium connector configuration
 - `init-db.sql`: Database initialization script
 - `data-generator/generator.py`: Data generation service
@@ -261,7 +284,7 @@ docker exec -it postgres psql -U postgres -d testdb -c \
 
 # Drop and recreate slot if needed
 docker exec -it postgres psql -U postgres -d testdb -c \
-  "SELECT pg_drop_replication_slot('confluent_cdc_slot');"
+  "SELECT pg_drop_replication_slot('debezium_slot');"
 ```
 
 ### Reset connector offset
