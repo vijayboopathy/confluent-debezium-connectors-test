@@ -1,18 +1,18 @@
-# Confluent CDC Connector Testing with PostgreSQL Database Upgrade
+# Confluent PostgreSQL CDC Connector Testing with Database Upgrade
 
-This project tests Confluent/Debezium CDC connector behavior during a PostgreSQL database upgrade, focusing on offset management and replication slot handling.
+This project tests the Confluent PostgreSQL CDC Source Connector v2 behavior during a PostgreSQL database upgrade, focusing on offset management and replication slot handling.
 
 ## Architecture
 
 ```
-Data Generator Service → PostgreSQL (with logical replication) → Replication Slot → Debezium CDC Connector → Kafka
+Data Generator Service → PostgreSQL (with logical replication) → Replication Slot → Confluent CDC Connector → Kafka
 ```
 
 ## Components
 
-- **PostgreSQL 15**: Configured with logical replication (`wal_level=logical`)
-- **Confluent Platform**: Kafka, Zookeeper, Schema Registry, Kafka Connect
-- **Debezium PostgreSQL Connector**: CDC connector using pgoutput plugin
+- **PostgreSQL 16**: Configured with logical replication (`wal_level=logical`)
+- **Confluent Platform 7.5.0**: Kafka, Zookeeper, Schema Registry, Kafka Connect
+- **Confluent PostgreSQL CDC Source Connector v2 (2.8.0)**: CDC connector using PostgreSQL logical replication
 - **Data Generator**: Python service that continuously writes to PostgreSQL
 
 ## Prerequisites
@@ -62,14 +62,14 @@ Before the upgrade, capture the current replication slot and offset information:
 ```bash
 # Check replication slot status
 docker exec -it postgres psql -U postgres -d testdb -c \
-  "SELECT * FROM pg_replication_slots WHERE slot_name = 'debezium_slot';"
+  "SELECT * FROM pg_replication_slots WHERE slot_name = 'confluent_cdc_slot';"
 
 # Check connector offset
 curl http://localhost:8083/connectors/postgres-cdc-connector/offsets
 
 # Note the LSN (Log Sequence Number)
 docker exec -it postgres psql -U postgres -d testdb -c \
-  "SELECT confirmed_flush_lsn FROM pg_replication_slots WHERE slot_name = 'debezium_slot';"
+  "SELECT confirmed_flush_lsn FROM pg_replication_slots WHERE slot_name = 'confluent_cdc_slot';"
 ```
 
 ### Step 2: Pause the Connector
@@ -96,17 +96,17 @@ docker cp postgres:/tmp/testdb_backup.dump ./testdb_backup.dump
 
 ### Step 5: Simulate Database Upgrade
 
-Option A - Upgrade PostgreSQL version in-place:
+Option A - Upgrade PostgreSQL version in-place (e.g., from 16.0 to 16.1):
 ```bash
 # Stop all services
 docker-compose down
 
-# Edit docker-compose.yml and change postgres image to postgres:16
+# Edit docker-compose.yml and change postgres image to postgres:16.1 or postgres:17
 # Then restart
 docker-compose up -d postgres
 ```
 
-Option B - Create new database instance:
+Option B - Create new database instance (simulate migration to new server):
 ```bash
 # Start new postgres instance (on different port)
 docker run -d --name postgres-new \
@@ -114,7 +114,7 @@ docker run -d --name postgres-new \
   -e POSTGRES_PASSWORD=postgres \
   -e POSTGRES_DB=testdb \
   -p 5433:5432 \
-  postgres:16 \
+  postgres:17 \
   postgres -c wal_level=logical \
            -c max_wal_senders=10 \
            -c max_replication_slots=10
@@ -131,10 +131,10 @@ docker exec postgres-new pg_restore -U postgres -d testdb /tmp/testdb_backup.dum
 docker exec -it postgres psql -U postgres -d testdb
 
 # Create the replication slot with the same name
-SELECT * FROM pg_create_logical_replication_slot('debezium_slot', 'pgoutput');
+SELECT * FROM pg_create_logical_replication_slot('confluent_cdc_slot', 'pgoutput');
 
 # Create publication
-CREATE PUBLICATION debezium_publication FOR TABLE public.orders, public.customers;
+CREATE PUBLICATION confluent_cdc_publication FOR TABLE public.orders, public.customers;
 
 # Set replica identity
 ALTER TABLE orders REPLICA IDENTITY FULL;
@@ -201,23 +201,44 @@ docker exec -it postgres psql -U postgres -d testdb -c \
 
 ## Offset Management Details
 
-The Debezium connector stores offsets in the Kafka topic `docker-connect-offsets`. Key information includes:
+The Confluent PostgreSQL CDC connector stores offsets in the Kafka topic `docker-connect-offsets`. Key information includes:
 
 - **LSN (Log Sequence Number)**: PostgreSQL's position in the WAL
 - **Transaction ID**: Last processed transaction
 - **Timestamp**: When the offset was recorded
 
 The connector configuration uses:
-- `slot.name`: `debezium_slot` - the replication slot name
-- `publication.name`: `debezium_publication` - the logical replication publication
+- `slot.name`: `confluent_cdc_slot` - the replication slot name
+- `publication.name`: `confluent_cdc_publication` - the logical replication publication
 - `snapshot.mode`: `initial` - takes initial snapshot, then streams changes
+- `output.data.format`: `AVRO` - outputs data in Avro format with Schema Registry integration
+- `after.state.only`: `true` - emits only the final state of the row (not before/after)
+
+## Automated Testing
+
+For automated testing of the upgrade scenario, use the provided test script:
+
+```bash
+./test-upgrade.sh
+```
+
+This script will:
+1. Capture current state (LSN, offsets, message counts)
+2. Pause the connector and stop data generator
+3. Insert test data during simulated downtime
+4. Create database backup
+5. Restart PostgreSQL (simulating upgrade)
+6. Verify replication slot persistence
+7. Resume connector and data generator
+8. Verify no data loss and offset resume
 
 ## Key Configuration Files
 
-- `docker-compose.yml`: Complete stack definition
+- `docker-compose.yml`: Complete stack definition with PostgreSQL 16
 - `connector-config.json`: Debezium connector configuration
 - `init-db.sql`: Database initialization script
 - `data-generator/generator.py`: Data generation service
+- `test-upgrade.sh`: Automated upgrade testing script
 
 ## Troubleshooting
 
@@ -240,7 +261,7 @@ docker exec -it postgres psql -U postgres -d testdb -c \
 
 # Drop and recreate slot if needed
 docker exec -it postgres psql -U postgres -d testdb -c \
-  "SELECT pg_drop_replication_slot('debezium_slot');"
+  "SELECT pg_drop_replication_slot('confluent_cdc_slot');"
 ```
 
 ### Reset connector offset
@@ -266,9 +287,36 @@ docker-compose down -v
 rm -f testdb_backup.dump
 ```
 
-## Notes
+## Important Considerations
 
-- The replication slot will grow if the connector is paused for extended periods
-- Monitor disk space on PostgreSQL during upgrades
-- The connector automatically handles schema changes in most cases
-- For major version upgrades, test thoroughly in a non-production environment first
+### Replication Slot Management
+- **Slot Growth**: The replication slot will accumulate WAL data if the connector is paused for extended periods
+- **Disk Space**: Monitor PostgreSQL disk space during upgrades, especially with active replication slots
+- **Retention**: WAL files are retained until consumed by all replication slots
+
+### Database Upgrade Scenarios
+- **Minor Version Upgrades** (e.g., 16.0 → 16.1): Generally safe with minimal downtime
+- **Major Version Upgrades** (e.g., 16 → 17): Requires more careful planning:
+  - Test thoroughly in non-production environment
+  - Verify Debezium connector compatibility with new PostgreSQL version
+  - Check for breaking changes in logical replication protocol
+  - Consider using `pg_upgrade` for in-place upgrades
+
+### Offset Management Best Practices
+- **Before Upgrade**: Always capture current LSN and connector offsets
+- **During Upgrade**: Keep connector paused to prevent connection errors
+- **After Upgrade**: Verify replication slot exists before resuming connector
+- **Validation**: Check for data continuity by comparing message counts and verifying test transactions
+
+### Schema Changes
+- The connector automatically handles most schema changes (ALTER TABLE, ADD COLUMN)
+- Replica identity set to FULL captures all column changes (before/after values)
+- For destructive changes (DROP TABLE), manually update connector configuration
+
+### Production Recommendations
+1. Test upgrade procedure in staging environment first
+2. Schedule maintenance window for upgrade
+3. Monitor connector lag metrics before and after upgrade
+4. Have rollback plan ready (database backups, connector configuration)
+5. Document LSN positions at each stage for troubleshooting
+6. Consider blue-green deployment for zero-downtime upgrades

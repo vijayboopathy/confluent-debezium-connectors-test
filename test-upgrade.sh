@@ -37,7 +37,7 @@ print_info "Connector status: $CONNECTOR_STATUS"
 # Get current LSN
 print_info "Capturing current LSN..."
 CURRENT_LSN=$(docker exec postgres psql -U postgres -d testdb -t -c \
-  "SELECT confirmed_flush_lsn FROM pg_replication_slots WHERE slot_name = 'debezium_slot';" | tr -d ' ')
+  "SELECT confirmed_flush_lsn FROM pg_replication_slots WHERE slot_name = 'confluent_cdc_slot';" | tr -d ' ')
 print_info "Current LSN: $CURRENT_LSN"
 
 # Get current offset
@@ -80,7 +80,7 @@ print_info "Backup created: testdb_backup_test.dump"
 # Step 6: Save replication slot info
 print_info "\nStep 6: Saving replication slot information..."
 docker exec postgres psql -U postgres -d testdb -c \
-  "SELECT * FROM pg_replication_slots WHERE slot_name = 'debezium_slot';" \
+  "SELECT * FROM pg_replication_slots WHERE slot_name = 'confluent_cdc_slot';" \
   > replication_slot_before.txt
 print_info "Replication slot info saved to replication_slot_before.txt"
 
@@ -101,14 +101,14 @@ print_info "PostgreSQL is ready"
 # Step 8: Verify replication slot survived restart
 print_info "\nStep 8: Verifying replication slot..."
 SLOT_EXISTS=$(docker exec postgres psql -U postgres -d testdb -t -c \
-  "SELECT COUNT(*) FROM pg_replication_slots WHERE slot_name = 'debezium_slot';" | tr -d ' ')
+  "SELECT COUNT(*) FROM pg_replication_slots WHERE slot_name = 'confluent_cdc_slot';" | tr -d ' ')
 
 if [ "$SLOT_EXISTS" -eq "1" ]; then
     print_info "Replication slot exists: ✓"
 else
     print_warning "Replication slot missing! Recreating..."
     docker exec postgres psql -U postgres -d testdb -c \
-      "SELECT * FROM pg_create_logical_replication_slot('debezium_slot', 'pgoutput');"
+      "SELECT * FROM pg_create_logical_replication_slot('confluent_cdc_slot', 'pgoutput');"
 fi
 
 # Step 9: Resume connector

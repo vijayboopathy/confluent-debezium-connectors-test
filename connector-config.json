@@ -1,7 +1,7 @@
 {
   "name": "postgres-cdc-connector",
   "config": {
-    "connector.class": "io.debezium.connector.postgresql.PostgresConnector",
+    "connector.class": "io.confluent.connect.cdc.postgres.PostgresCdcSourceConnector",
     "tasks.max": "1",
     "database.hostname": "postgres",
     "database.port": "5432",
@@ -10,22 +10,24 @@
     "database.dbname": "testdb",
     "database.server.name": "postgres_server",
     "topic.prefix": "cdc",
-    "plugin.name": "pgoutput",
-    "slot.name": "debezium_slot",
-    "publication.name": "debezium_publication",
+    "slot.name": "confluent_cdc_slot",
+    "publication.name": "confluent_cdc_publication",
     "publication.autocreate.mode": "filtered",
     "table.include.list": "public.orders,public.customers",
-    "heartbeat.interval.ms": "10000",
-    "heartbeat.action.query": "INSERT INTO heartbeat (ts) VALUES (NOW()) ON CONFLICT DO NOTHING",
     "snapshot.mode": "initial",
     "key.converter": "org.apache.kafka.connect.json.JsonConverter",
     "value.converter": "org.apache.kafka.connect.json.JsonConverter",
     "key.converter.schemas.enable": "false",
     "value.converter.schemas.enable": "true",
-    "transforms": "unwrap",
-    "transforms.unwrap.type": "io.debezium.transforms.ExtractNewRecordState",
-    "transforms.unwrap.drop.tombstones": "false",
-    "transforms.unwrap.delete.handling.mode": "rewrite",
-    "transforms.unwrap.add.fields": "op,source.ts_ms,source.lsn"
+    "output.data.format": "JSON",
+    "output.key.format": "JSON",
+    "after.state.only": "false",
+    "delete.enabled": "true",
+    "schema.registry.url": "http://schema-registry:8081",
+    "tombstone.on.delete": "true",
+    "poll.interval.ms": "1000",
+    "max.batch.size": "1000",
+    "slot.drop.on.stop": "false",
+    "heartbeat.interval.ms": "10000"
   }
 }
