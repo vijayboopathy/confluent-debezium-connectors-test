@@ -57,10 +57,23 @@ Debezium is an excellent open-source alternative that provides:
    ```
 
 4. **Deploy the CDC connector**:
+   
+   **For initial deployment or standard upgrades (Scenario 1):**
    ```bash
    curl -X POST http://localhost:8083/connectors \
      -H "Content-Type: application/json" \
      -d @connector-config.json
+   ```
+   
+   **For PGbackrest restore upgrades (Scenario 2 - CrunchyBridge):**
+   ```bash
+   # First, recreate replication infrastructure
+   ./post-upgrade-setup.sh
+   
+   # Then deploy with snapshot.mode: never (prevents duplicates)
+   curl -X POST http://localhost:8083/connectors \
+     -H "Content-Type: application/json" \
+     -d @connector-config-post-upgrade.json
    ```
 
 5. **Check connector status**:
@@ -81,7 +94,47 @@ Debezium is an excellent open-source alternative that provides:
      --from-beginning
    ```
 
-## Testing Database Upgrade with Offset Resume
+## Choosing Your Upgrade Strategy
+
+⚠️ **IMPORTANT: Choose the correct configuration based on your upgrade type**
+
+### Scenario 1: In-Place Upgrades (LSN Continuity Preserved)
+**Use this for:**
+- Minor PostgreSQL version upgrades (e.g., 16.0 → 16.1)
+- Major version upgrades using `pg_upgrade` (e.g., 16 → 17)
+- Upgrades where replication slots are preserved
+
+**Configuration:** `connector-config.json` (with `snapshot.mode: initial`)  
+**Procedure:** Pause connector → Upgrade database → Resume connector  
+**Result:** ✅ No duplicates, ✅ No gap  
+**See:** "Testing Database Upgrade with Offset Resume" section below
+
+### Scenario 2: PGbackrest Restore (LSN Continuity Lost)
+**Use this for:**
+- **CrunchyBridge database upgrades** ⚠️
+- Cross-region database migrations
+- Disaster recovery from backups
+- Any situation where database is restored using `pg_dump`/`pg_restore` or PGbackrest
+
+**Configuration:** `connector-config-post-upgrade.json` (with `snapshot.mode: never`)  
+**Procedure:** Delete connector → Restore database → Recreate replication infrastructure → Deploy new connector  
+**Result:** ✅ Zero duplicates, ⚠️ Gap exists (changes during upgrade window not captured)  
+**See:** [CRUNCHYBRIDGE-UPGRADE.md](CRUNCHYBRIDGE-UPGRADE.md) for complete guide
+
+### Configuration Comparison
+
+| Setting | connector-config.json | connector-config-post-upgrade.json |
+|---------|----------------------|-----------------------------------|
+| **Use Case** | Initial deployment, Scenario 1 | Scenario 2 (after PGbackrest restore) |
+| **snapshot.mode** | `initial` (takes snapshot) | `never` (no snapshot) ⚠️ |
+| **publication.autocreate.mode** | `filtered` | `disabled` |
+| **When to Use** | Standard upgrades, first deploy | After backup/restore upgrades |
+| **Duplicates** | None (with Scenario 1) | Zero (skips snapshot) |
+| **Gap** | None | Yes (acceptable tradeoff) |
+
+## Testing Database Upgrade with Offset Resume (Scenario 1)
+
+⚠️ **This section is for Scenario 1 only.** For CrunchyBridge/PGbackrest upgrades (Scenario 2), see [CRUNCHYBRIDGE-UPGRADE.md](CRUNCHYBRIDGE-UPGRADE.md).
 
 ### Step 1: Capture Current State
 
@@ -296,17 +349,33 @@ This script:
 
 ## Key Configuration Files
 
+### Core Files
 - `docker-compose.yml`: Complete stack definition with PostgreSQL 16
 - `Dockerfile.connect`: Custom Kafka Connect image with Debezium pre-installed
-- `connector-config.json`: Debezium connector configuration (initial deployment)
-- `connector-config-post-upgrade.json`: Connector configuration for post-PGbackrest restore (snapshot.mode: never)
 - `init-db.sql`: Database initialization script
 - `data-generator/generator.py`: Data generation service
-- `test-upgrade.sh`: Standard upgrade testing script (LSN continuity preserved)
-- `test-pgbackrest-restore.sh`: PGbackrest restore simulation (LSN continuity lost)
-- `post-upgrade-setup.sh`: Recreates replication infrastructure after restore
+
+### Connector Configurations (Choose One)
+- **`connector-config.json`**: 
+  - For initial deployment and Scenario 1 (standard upgrades)
+  - Has `snapshot.mode: initial` (takes initial snapshot, then streams changes)
+  - Use when replication slots are preserved during upgrade
+  
+- **`connector-config-post-upgrade.json`**: ⚠️
+  - For Scenario 2 (PGbackrest restore / CrunchyBridge upgrades)
+  - Has `snapshot.mode: never` (NO snapshot - prevents duplicates)
+  - Use after backup/restore when LSN continuity is lost
+  - **This is the key difference for preventing duplicates!**
+
+### Scripts
+- `test-upgrade.sh`: Standard upgrade testing (Scenario 1 - LSN preserved)
+- `test-pgbackrest-restore.sh`: PGbackrest restore simulation (Scenario 2 - LSN lost)
+- `post-upgrade-setup.sh`: Recreates replication slots and publications after restore
 - `verify-no-duplicates.sh`: Verifies no duplicate events in Kafka
-- `CRUNCHYBRIDGE-UPGRADE.md`: Comprehensive CrunchyBridge upgrade guide
+
+### Documentation
+- `CRUNCHYBRIDGE-UPGRADE.md`: Comprehensive guide for CrunchyBridge/PGbackrest upgrades
+- `CONNECTOR-CONFIG.md`: Detailed connector configuration reference
 
 ## Troubleshooting
 
@@ -318,6 +387,66 @@ docker-compose logs kafka-connect
 
 # Verify PostgreSQL is accessible
 docker exec -it kafka-connect ping postgres
+```
+
+### I used the wrong connector config - seeing duplicates!
+
+**Problem:** Deployed `connector-config.json` (with `snapshot.mode: initial`) after a PGbackrest restore, now seeing duplicate events.
+
+**Solution:**
+```bash
+# 1. Delete the connector
+curl -X DELETE http://localhost:8083/connectors/postgres-cdc-connector
+
+# 2. Wait a few seconds
+sleep 5
+
+# 3. Deploy with the correct config (snapshot.mode: never)
+curl -X POST http://localhost:8083/connectors \
+  -H "Content-Type: application/json" \
+  -d @connector-config-post-upgrade.json
+
+# 4. Verify it's using the right config
+curl http://localhost:8083/connectors/postgres-cdc-connector/config | jq '.["snapshot.mode"]'
+# Should show: "never"
+```
+
+### How do I know which connector config to use?
+
+**Use `connector-config.json` if:**
+- ✅ First time deploying the connector
+- ✅ Database upgraded in-place (minor version bump)
+- ✅ Used `pg_upgrade` for major version upgrade
+- ✅ Replication slot still exists after upgrade
+
+**Use `connector-config-post-upgrade.json` if:**
+- ✅ Database restored from backup (PGbackrest, pg_dump, pg_restore)
+- ✅ **CrunchyBridge database upgrade**
+- ✅ Cross-region migration
+- ✅ Replication slot does NOT exist after upgrade
+- ✅ Want zero duplicates (accept gap)
+
+**Quick test:**
+```bash
+# Check if replication slot exists
+docker exec postgres psql -U postgres -d testdb -c \
+  "SELECT COUNT(*) FROM pg_replication_slots WHERE slot_name = 'debezium_slot';"
+
+# If returns 0: Use connector-config-post-upgrade.json
+# If returns 1: Can use connector-config.json
+```
+
+### Seeing duplicate events in Kafka
+
+**Cause:** Used `snapshot.mode: initial` after a backup/restore upgrade (LSN timeline changed)
+
+**Prevention:**
+- Always use `connector-config-post-upgrade.json` (with `snapshot.mode: never`) after PGbackrest restores
+
+**Verification:**
+```bash
+# Run duplicate detection
+./verify-no-duplicates.sh
 ```
 
 ### Replication slot issues
@@ -412,5 +541,53 @@ rm -f testdb_backup.dump
 4. Have rollback plan ready (database backups, connector configuration)
 5. Document LSN positions at each stage for troubleshooting
 6. **For PGbackrest restores**: Use `./post-upgrade-setup.sh` to ensure proper infrastructure recreation
-7. **For zero duplicates**: Always use `snapshot.mode: never` after PGbackrest restore
+7. **For zero duplicates**: Always use `connector-config-post-upgrade.json` (with `snapshot.mode: never`) after PGbackrest restore
 8. **Verify**: Run `./verify-no-duplicates.sh` after upgrade completes
+
+## Quick Reference Guide
+
+### For CrunchyBridge Users (or any PGbackrest restore)
+
+**Step-by-step:**
+1. **Before upgrade:** Delete connector (not pause)
+   ```bash
+   curl -X DELETE http://localhost:8083/connectors/postgres-cdc-connector
+   ```
+
+2. **CrunchyBridge performs upgrade** (database frozen, PGbackrest restore happens)
+
+3. **After upgrade:** Recreate replication infrastructure
+   ```bash
+   ./post-upgrade-setup.sh
+   ```
+
+4. **Deploy connector with snapshot.mode: never** (prevents duplicates)
+   ```bash
+   curl -X POST http://localhost:8083/connectors \
+     -H "Content-Type: application/json" \
+     -d @connector-config-post-upgrade.json
+   ```
+
+5. **Verify zero duplicates**
+   ```bash
+   ./verify-no-duplicates.sh
+   ```
+
+**Key point:** Use `connector-config-post-upgrade.json` (NOT `connector-config.json`) to prevent duplicates!
+
+### For Standard In-Place Upgrades
+
+**Step-by-step:**
+1. Pause connector
+   ```bash
+   curl -X PUT http://localhost:8083/connectors/postgres-cdc-connector/pause
+   ```
+
+2. Perform database upgrade (minor version or pg_upgrade)
+
+3. Resume connector
+   ```bash
+   curl -X PUT http://localhost:8083/connectors/postgres-cdc-connector/resume
+   ```
+
+**Key point:** Replication slot preserved, connector resumes from stored offset automatically.
