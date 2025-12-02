@@ -2,6 +2,12 @@
 
 This project tests the Debezium PostgreSQL CDC connector behavior during a PostgreSQL database upgrade, focusing on offset management and replication slot handling.
 
+**Key Testing Scenarios:**
+- Standard in-place PostgreSQL upgrades (LSN continuity preserved)
+- PGbackrest-style restores (LSN continuity lost - like CrunchyBridge upgrades)
+- Zero-duplicate CDC event strategies
+- Gap analysis and verification
+
 ## Architecture
 
 ```
@@ -238,7 +244,9 @@ The connector configuration uses:
 
 ## Automated Testing
 
-For automated testing of the upgrade scenario, use the provided test script:
+### Standard Upgrade Test (LSN Continuity Preserved)
+
+For testing upgrades where replication slots persist (e.g., minor version upgrades):
 
 ```bash
 ./test-upgrade.sh
@@ -254,14 +262,51 @@ This script will:
 7. Resume connector and data generator
 8. Verify no data loss and offset resume
 
+### PGbackrest Restore Test (LSN Continuity Lost)
+
+For testing upgrades where database is restored from backup (e.g., CrunchyBridge upgrades):
+
+```bash
+./test-pgbackrest-restore.sh
+```
+
+This script simulates a **CrunchyBridge-style upgrade** where:
+1. Database is restored using PGbackrest (LSN timeline changes)
+2. Replication slots and publications are NOT preserved
+3. Connector must be reconfigured with `snapshot.mode: never` to prevent duplicates
+4. Gap exists (changes during upgrade are not captured)
+5. Verifies zero duplicates after upgrade
+
+**See [CRUNCHYBRIDGE-UPGRADE.md](CRUNCHYBRIDGE-UPGRADE.md) for detailed CrunchyBridge upgrade procedures.**
+
+### Verification Script
+
+To verify no duplicate events after upgrade:
+
+```bash
+./verify-no-duplicates.sh
+```
+
+This script:
+- Checks for duplicate primary keys in Kafka messages
+- Verifies LSN uniqueness
+- Analyzes operation types (detects unexpected snapshot reads)
+- Compares database row count vs Kafka message count (gap detection)
+- Provides pass/fail results
+
 ## Key Configuration Files
 
 - `docker-compose.yml`: Complete stack definition with PostgreSQL 16
 - `Dockerfile.connect`: Custom Kafka Connect image with Debezium pre-installed
-- `connector-config.json`: Debezium connector configuration
+- `connector-config.json`: Debezium connector configuration (initial deployment)
+- `connector-config-post-upgrade.json`: Connector configuration for post-PGbackrest restore (snapshot.mode: never)
 - `init-db.sql`: Database initialization script
 - `data-generator/generator.py`: Data generation service
-- `test-upgrade.sh`: Automated upgrade testing script
+- `test-upgrade.sh`: Standard upgrade testing script (LSN continuity preserved)
+- `test-pgbackrest-restore.sh`: PGbackrest restore simulation (LSN continuity lost)
+- `post-upgrade-setup.sh`: Recreates replication infrastructure after restore
+- `verify-no-duplicates.sh`: Verifies no duplicate events in Kafka
+- `CRUNCHYBRIDGE-UPGRADE.md`: Comprehensive CrunchyBridge upgrade guide
 
 ## Troubleshooting
 
@@ -318,18 +363,42 @@ rm -f testdb_backup.dump
 - **Retention**: WAL files are retained until consumed by all replication slots
 
 ### Database Upgrade Scenarios
+
+#### Scenario 1: In-Place Upgrades (LSN Continuity Preserved)
 - **Minor Version Upgrades** (e.g., 16.0 → 16.1): Generally safe with minimal downtime
-- **Major Version Upgrades** (e.g., 16 → 17): Requires more careful planning:
-  - Test thoroughly in non-production environment
-  - Verify Debezium connector compatibility with new PostgreSQL version
-  - Check for breaking changes in logical replication protocol
-  - Consider using `pg_upgrade` for in-place upgrades
+- **Major Version Upgrades with pg_upgrade** (e.g., 16 → 17): LSN continuity maintained
+- **Strategy**: Pause connector, upgrade, resume connector
+- **Result**: No duplicates, no gap - connector resumes from stored offset
+- **Use**: `connector-config.json` with standard settings
+
+#### Scenario 2: PGbackrest Restore (LSN Continuity Lost)
+- **CrunchyBridge upgrades**: Uses PGbackrest restore
+- **Cross-region migrations**: Restore from backup to new instance
+- **Disaster recovery**: Restore from point-in-time backup
+- **Key Issue**: New LSN timeline makes old offsets invalid
+- **Strategy**: Delete connector, restore database, recreate replication infrastructure, deploy with `snapshot.mode: never`
+- **Result**: Zero duplicates, gap exists (acceptable tradeoff)
+- **Use**: `connector-config-post-upgrade.json` and `post-upgrade-setup.sh`
+- **See**: [CRUNCHYBRIDGE-UPGRADE.md](CRUNCHYBRIDGE-UPGRADE.md) for detailed guide
+
+### Duplicate Prevention Strategies
+
+**For applications that CANNOT handle duplicates:**
+1. Use `snapshot.mode: never` after PGbackrest restore
+2. Accept gap during upgrade window
+3. Optionally: Manually backfill gap data if critical
+
+**For applications that CAN handle duplicates (idempotent):**
+1. Use `snapshot.mode: initial` after restore
+2. Fresh baseline of all data
+3. Longer startup time but no gap
 
 ### Offset Management Best Practices
 - **Before Upgrade**: Always capture current LSN and connector offsets
-- **During Upgrade**: Keep connector paused to prevent connection errors
-- **After Upgrade**: Verify replication slot exists before resuming connector
+- **During Upgrade**: Keep connector stopped (DELETE, not pause) for PGbackrest restores
+- **After Upgrade**: Verify replication slot exists before deploying connector
 - **Validation**: Check for data continuity by comparing message counts and verifying test transactions
+- **For PGbackrest Restores**: Always recreate replication infrastructure manually
 
 ### Schema Changes
 - The connector automatically handles most schema changes (ALTER TABLE, ADD COLUMN)
@@ -342,4 +411,6 @@ rm -f testdb_backup.dump
 3. Monitor connector lag metrics before and after upgrade
 4. Have rollback plan ready (database backups, connector configuration)
 5. Document LSN positions at each stage for troubleshooting
-6. Consider blue-green deployment for zero-downtime upgrades
+6. **For PGbackrest restores**: Use `./post-upgrade-setup.sh` to ensure proper infrastructure recreation
+7. **For zero duplicates**: Always use `snapshot.mode: never` after PGbackrest restore
+8. **Verify**: Run `./verify-no-duplicates.sh` after upgrade completes
